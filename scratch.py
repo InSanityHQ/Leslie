@@ -110,6 +110,5 @@ logits_string = [bart_tokenizer.decode(i) for i in [torch.argmax(i, axis=1) for 
 logits_string = [re.sub("<s>", "", i.split("</s>")[0]) for i in logits_string]
 rewards = [reward(i,j,0.7,similarity_model) for i,j in zip(batch, logits_string)]
 
-advantages = 
 
 # optim = AdamW(bart_model.parameters(), lr=config.learning_rate)
