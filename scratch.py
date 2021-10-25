@@ -47,10 +47,15 @@ def reward(src,tgt,reduce_factor,model,similarity_mix=0.5):
     b = unique_words(tgt)
     target_vocab_size = a*reduce_factor
 
-    vocab_reduction = 1-abs(b-target_vocab_size)/b
-    scaled_vocab_reduction = vocab_reduction *(1-similarity_mix)
+    try: 
+        vocab_reduction = 1-abs(b-target_vocab_size)/b
+        scaled_vocab_reduction = vocab_reduction *(1-similarity_mix)
+    except ZeroDivisionError:
+        scaled_vocab_reduction = 0
 
     return scaled_similarity+scaled_vocab_reduction
+
+    # return semantic_similarity(src,tgt,model)
 
 ##############################
 ### zach you converted me ####
@@ -85,8 +90,8 @@ class Critic(nn.Module):
         return x
 
 MAX_LENGTH = 50
-ACTOR_LR = 3e-3
-CRITIC_LR = 1e-3
+ACTOR_LR = 1e-5
+CRITIC_LR = 1e-4
 BATCH_SIZE = 16
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 np2tens = lambda x: torch.tensor(x)
@@ -135,7 +140,6 @@ for batch_id in dataset_bar:
 
     # Calculate the log probabilites of the model output by softmaxing it
     logits_log_probs = F.softmax(logits, dim=2).log()
-    logits_log_probs = torch.stack([l*a for l,a in zip(logits_log_probs,advantages_nograd)])
 
     # Gather the probability values of the selected actions
     action_log_probs = logits_log_probs.gather(2, torch.unsqueeze(actions, 2))
@@ -146,19 +150,19 @@ for batch_id in dataset_bar:
     # So it's just MSE loss 
     critic_loss = advantages.pow(2).mean()
 
-    dataset_bar.set_description(f"Batch: {batch_id}, Actor: {actor_loss.item()}, Critic: {critic_loss.item()}")
+    dataset_bar.set_description(f"Sample: {batch_id}, Actor: {round(actor_loss.item(),3)}, Critic: {round(critic_loss.item(),3)}, Reward: {round(rewards[0].item(),3)}")
 
-    if batch_id % 100:
-        print(f"Batch: {batch_id}; Output: {logits_string[0]}")
+    if batch_id % 500 == 0:
+        print(f"Sample: {batch_id}; Output: {logits_string[0]}")
 
     # Add the losses
     loss = actor_loss+critic_loss
     # Backprop!
     loss.backward()
 
-    actor_optim.step()
     critic_optim.step()
-
-    actor_optim.zero_grad()
     critic_optim.zero_grad()
+
+    actor_optim.step()
+    actor_optim.zero_grad()
     # optim = AdamW(bart_model.parameters(), lr=config.learning_rate)
