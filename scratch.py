@@ -38,7 +38,7 @@ def semantic_similarity(a,b,model):
     return util.pytorch_cos_sim(a,b)[0][0].item()
 
 # Mixed simplification reward 
-def reward(src,tgt,reduce_factor,model,similarity_mix=0.7):
+def reward(src,tgt,reduce_factor,model,similarity_mix=0.5):
     scaled_similarity = similarity_mix*semantic_similarity(src,tgt,model)
 
     a = unique_words(src)
@@ -98,17 +98,49 @@ similarity_model = SentenceTransformer('stsb-bert-base')
 # for sentence in dataset_train:
 batch = [dataset_train[0], dataset_train[1]]
 
+# Encode each sentence 
 sentence_encoded = [bart_tokenizer.encode(i)[:MAX_LENGTH] for i in batch]
+# Pad the encoded result to the MAX_LENGTH
 sentence_padded = np2tens([i + [1 for _ in range(MAX_LENGTH-len(i))] for i in sentence_encoded]).to(DEVICE)
+# Mask the attention such that only non-padded values are available
 sentence_mask = np2tens([[1 for _ in range(len(i))] + [0 for _ in range(MAX_LENGTH-len(i))] for i in sentence_encoded]).to(DEVICE)
 
+# Put it through the model!
 result = bart_model(sentence_padded, attention_mask=sentence_mask)
+# Logit-shame the state. We support logit-shaming
+# to figure out what the value of the state is 
+values = torch.flatten(critic_model(F.one_hot(sentence_padded, num_classes=bart_tokenizer.vocab_size).float()))
+# Get the logits
 logits = result["logits"]
-values = critic_model(logits)
 
-logits_string = [bart_tokenizer.decode(i) for i in [torch.argmax(i, axis=1) for i in logits.detach()]]
+# Select for the predicted outputs
+actions = torch.stack([torch.argmax(i, axis=1) for i in logits.detach()])
+# Stringify the outputs
+logits_string = [bart_tokenizer.decode(i) for i in actions]
+# Return the final string
 logits_string = [re.sub("<s>", "", i.split("</s>")[0]) for i in logits_string]
-rewards = [reward(i,j,0.7,similarity_model) for i,j in zip(batch, logits_string)]
+# Calculate reward value for these strings
+rewards = np2tens([reward(i,j,0.5,similarity_model) for i,j in zip(batch, logits_string)]).to(DEVICE)
 
+# Calculate the advantages of the model
+advantages = rewards - values
+
+# Calculate the log probabilites of the model output by softmaxing it
+logits_log_probs = F.softmax(logits, dim=2).log()
+logits_log_probs = torch.stack([l*a for l,a in zip(logits_log_probs,advantages_nograd)])
+
+# Gather the probability values of the selected actions
+action_log_probs = logits_log_probs.gather(2, torch.unsqueeze(actions, 2))
+
+# Add em up, multiply by the advantage, and calculate the mean
+actor_loss = -(advantages.detach()*action_log_probs).mean()
+# The critic wants to match the actual rewards as much as possible
+# So it's just MSE loss 
+critic_loss = advantages.pow(2).mean()
+
+# Add the losses
+loss = actor_loss+critic_loss
+# Backprop!
+loss.backward()
 
 # optim = AdamW(bart_model.parameters(), lr=config.learning_rate)
