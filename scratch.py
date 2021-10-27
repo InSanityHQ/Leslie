@@ -31,10 +31,10 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 hyperparametre_defaults = dict(
     max_length = 50,
-    actor_lr = 5e-5,
-    critic_lr = 1e-3,
+    actor_lr = 1e-6,
+    critic_lr = 5e-6,
     batch_size = 16,
-    epochs = 20
+    epochs = 1000
 )
 
 run = wandb.init(entity='inscriptio', project='leslie', config=hyperparametre_defaults)
@@ -107,14 +107,12 @@ class Critic(nn.Module):
 
         self.batchnorm = nn.BatchNorm1d(max_length)
         self.d1 = nn.Linear(max_length, 32)
-        self.d2 = nn.Linear(32, 16)
-        self.d3 = nn.Linear(16, 1)
+        self.d2 = nn.Linear(32, 1)
 
     def forward(self,x):
         x = self.batchnorm(x)
         x = F.relu(self.d1(x))
         x = F.relu(self.d2(x))
-        x = F.tanh(self.d3(x))
         return x
 
 critic_model = Critic(MAX_LENGTH)
@@ -130,8 +128,7 @@ critic_model.to(DEVICE)
 critic_model.train()
 critic_optim = AdamW(critic_model.parameters(), lr=CRITIC_LR)
 
-run.watch(bart_model)
-run.watch(critic_model)
+run.watch((bart_model, critic_model))
 
 print("Instantiating similarity model.")
 similarity_model = SentenceTransformer('stsb-bert-base')
