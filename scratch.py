@@ -107,12 +107,14 @@ class Critic(nn.Module):
 
         self.batchnorm = nn.BatchNorm1d(max_length)
         self.d1 = nn.Linear(max_length, 32)
-        self.d2 = nn.Linear(32, 1)
+        self.d2 = nn.Linear(32, 16)
+        self.d3 = nn.Linear(16, 1)
 
     def forward(self,x):
         x = self.batchnorm(x)
-        x = F.relu(self.d1(x))
-        x = F.relu(self.d2(x))
+        x = F.tanh(self.d1(x))
+        x = F.tanh(self.d2(x))
+        x = F.tanh(self.d3(x))
         return x
 
 critic_model = Critic(MAX_LENGTH)
