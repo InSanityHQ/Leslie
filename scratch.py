@@ -6,7 +6,7 @@ from nltk.tokenize import word_tokenize
 from collections import defaultdict
 
 from nltk.tokenize.treebank import TreebankWordDetokenizer
-from nltk.corpus import inaugural
+from nltk.corpus import brown
 
 from transformers import BartConfig, BartTokenizer, BartForConditionalGeneration
 from transformers import AdamW
@@ -16,10 +16,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Categorical
 
+import statistics
+
 import numpy as np
 import re
 
 from tqdm import tqdm
+import math
 
 import wandb
 
@@ -31,10 +34,10 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 hyperparametre_defaults = dict(
     max_length = 50,
-    actor_lr = 1e-5,
-    # critic_lr = 5e-5,
+    actor_lr = 5e-5,
     batch_size = 16,
-    epochs = 1000
+    epochs = 1000,
+    replay_buffer = 20
 )
 
 run = wandb.init(entity='inscriptio', project='leslie', config=hyperparametre_defaults)
@@ -46,19 +49,31 @@ ACTOR_LR = config.actor_lr
 # CRITIC_LR = config.critic_lr
 BATCH_SIZE = config.batch_size
 EPOCHS = config.epochs
+REPLAY = config.replay_buffer
 
-# Simplicity evalutaion
-def unique_words(sentence):
-    words = [i.lower() for i in word_tokenize(sentence)]
-    seen = []
+print("Setting up dataset and reward.")
+detokenizer = TreebankWordDetokenizer()
+dataset_sents = [detokenizer.detokenize(i) for i in brown.sents()]
+dataset_words = [i.lower() for i in brown.words()]
+usage = defaultdict(int)
 
-    wc = 0
-    for word in words:
-        if word not in seen:
-            wc += 1
-            seen.append(word)
+# We count the usage of each word
+for word in dataset_words:
+    usage[word] += 1
 
-    return wc
+# We get the mean and stddev usage and normalize the
+# usages by them
+usage_mean = statistics.mean(usage.values())
+usage_stddev = statistics.stdev(usage.values())
+
+# Finally, we normalize every value based on this
+# difference. We encourage results to be higher
+# than mean so we don't abs value. Also we will
+# take the tanh of the output to normalize it
+# between -1 and 1
+
+for key in usage.keys():
+    usage[key] = np.tanh((usage[key]-usage_mean)/usage_stddev)
 
 # Find out the sentence similarity between two sentences
 # using a model.
@@ -67,58 +82,38 @@ def semantic_similarity(a,b,model):
     return util.pytorch_cos_sim(a,b)[0][0].item()
 
 # Mixed simplification reward 
-def reward(src,tgt,reduce_factor,model,similarity_mix=0.5):
-    # scaled_similarity = semantic_similarity(src,tgt,model)
+def reward(src,tgt,model):
+    words_src = [i.lower() for i in word_tokenize(src)]
+    words_tgt = [i.lower() for i in word_tokenize(tgt)]
 
-    # a = unique_words(src)
-    # b = unique_words(tgt)
-    # target_vocab_size = a*reduce_factor
+    try: 
+        usage_src = sum([usage[i] for i in words_src])/len(words_src)
+        usage_tgt = sum([usage[i] for i in words_tgt])/len(words_tgt)
+        simplification_rating = ((usage_tgt-usage_src)/usage_src)-0.5
+    except ZeroDivisionError:
+        simplification_rating = -2
 
-    # try: 
-    #     vocab_reduction = 1-abs(b-target_vocab_size)/b
-    #     scaled_vocab_reduction = vocab_reduction *(1-similarity_mix)
-    # except ZeroDivisionError:
-    #     scaled_vocab_reduction = 0
+    scaled_similarity = semantic_similarity(src,tgt,model)
+    similarity_rating = scaled_similarity - 0.5
 
-           # subtract by 0.5 to be able to distribute negative reward
-    # return (scaled_similarity+scaled_vocab_reduction)-0.5
-    return semantic_similarity(src,tgt,model)
+                                                      # slight punishment for inaction
+    return (simplification_rating + similarity_rating)
 
-    # return semantic_similarity(src,tgt,model)
+print("Instantiating similarity model.")
+similarity_model = SentenceTransformer('stsb-bert-base')
 
 ##############################
 ### zach you converted me ####
 ##############################
 
 print("Establishing tokenizers and actor model.")
-detokenizer = TreebankWordDetokenizer()
-dataset = [detokenizer.detokenize(i) for i in inaugural.sents()]
 
-dataset_train = dataset[:int(len(dataset)*0.9)]
+dataset_train = dataset_sents[:int(len(dataset_sents)*0.9)]
 
 bart_config = BartConfig.from_pretrained("facebook/bart-base")
 # TODO any max length stuff
 bart_tokenizer = BartTokenizer.from_pretrained("facebook/bart-base")
 bart_model = BartForConditionalGeneration.from_pretrained("facebook/bart-base", config=bart_config)
-
-# print("Creating critic model.")
-# class Critic(nn.Module):
-#     def __init__(self, max_length):
-#         super(Critic,self).__init__()
-
-#         self.batchnorm = nn.BatchNorm1d(max_length)
-#         self.d1 = nn.Linear(max_length, 32)
-#         self.d2 = nn.Linear(32, 16)
-#         self.d3 = nn.Linear(16, 1)
-
-#     def forward(self,x):
-#         x = self.batchnorm(x)
-#         x = F.tanh(self.d1(x))
-#         x = F.tanh(self.d2(x))
-#         x = F.tanh(self.d3(x))
-#         return x
-
-# critic_model = Critic(MAX_LENGTH)
 
 np2tens = lambda x: torch.tensor(x)
 
@@ -127,15 +122,7 @@ bart_model.to(DEVICE)
 bart_model.train()
 actor_optim = AdamW(bart_model.parameters(), lr=ACTOR_LR)
 
-# critic_model.to(DEVICE)
-# critic_model.train()
-# critic_optim = AdamW(critic_model.parameters(), lr=CRITIC_LR)
-
-# run.watch((bart_model, critic_model))
 run.watch(bart_model)
-
-print("Instantiating similarity model.")
-similarity_model = SentenceTransformer('stsb-bert-base')
 
 print("Starting to train.")
 for _ in range(EPOCHS):
@@ -154,7 +141,7 @@ for _ in range(EPOCHS):
         result = bart_model(sentence_padded, attention_mask=sentence_mask)
         # Logit-shame the state. We support logit-shaming
         # to figure out what the value of the state is 
-        # values = torch.flatten(critic_model(sentence_padded.float()))
+
         # Get the logits
         logits = result["logits"]
 
@@ -165,33 +152,30 @@ for _ in range(EPOCHS):
         # Return the final string
         logits_string = [re.sub("<s>", "", i.split("</s>")[0]) for i in logits_string]
         # Calculate reward value for these strings
-        rewards = np2tens([reward(i,j,0.5,similarity_model,0.5) for i,j in zip(batch, logits_string)]).to(DEVICE)
+        rewards = np2tens([reward(i,j,similarity_model) for i,j in zip(batch, logits_string)]).to(DEVICE)
 
         # # Calculate the advantages of the model
-        # advantages = rewards - values
+        # advantages = rewards -
+
+        # Get the logits' probs by normalizing with softmax
+        logits_probs = F.softmax(logits, dim=2)
 
         # Gather the log probability values of the selected actions
-        action_log_probs = torch.sum(logits.gather(2, torch.unsqueeze(actions, 2)), dim=1).log()
+        action_log_probs = logits_probs.gather(2, torch.unsqueeze(actions, 2)).log()
 
         # Add em up, multiply by the advantage, and calculate the mean
-        actor_loss = torch.stack(
+        actor_loss = (torch.stack(
                         [a*l for a,l in zip(rewards,action_log_probs)]
-                     ).mean() * -1
+                     ).mean() * -1)/REPLAY
 
         # The critic wants to match the actual rewards as much as possible
         # So it's just MSE loss 
-        # critic_loss = advantages.pow(2).mean()
-
-        # dataset_bar.set_description(f"Sample: {batch_id}, Actor: {round(actor_loss.item(),3)}, Critic: {round(critic_loss.item(),3)}, Reward: {round(rewards[0].item(),3)}")
         dataset_bar.set_description(f"Sample: {batch_id}, Actor: {round(actor_loss.item(),3)}, Reward: {round(rewards[0].item(),3)}")
 
-        if batch_id % 500 == 0:
+        if i % 50 == 0:
             print(f"Sample: {batch_id}; Output: {logits_string[0]}")
 
-        # Add the losses
-        # loss = actor_loss+critic_loss
-
-        if i % 50 == 0:
+        if i % 10 == 0:
             run.log({"actor_loss": actor_loss.item(),
                      # "critic_loss": critic_loss.item(),
                      # "advantage": advantages.mean().item(),
@@ -199,13 +183,11 @@ for _ in range(EPOCHS):
                      "reward": rewards[0].item(),
                      "sample": wandb.Html(logits_string[0])})
 
+        # if we hit the replay buffer, then go ahead and update weights
+        if i != 0 and i % REPLAY == 0:
+            actor_optim.step()
+            actor_optim.zero_grad()
+
         # Backprop!
-        # loss.backward()
         actor_loss.backward()
-
-        # critic_optim.step()
-        # critic_optim.zero_grad()
-
-        actor_optim.step()
-        actor_optim.zero_grad()
-        # optim = AdamW(bart_model.parameters(), lr=config.learning_rate)
+        torch.nn.utils.clip_grad_norm_(bart_model.parameters(), 0.1)
