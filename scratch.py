@@ -34,10 +34,10 @@ DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cp
 
 hyperparametre_defaults = dict(
     max_length = 50,
-    actor_lr = 5e-5,
+    actor_lr = 1e-5,
     batch_size = 16,
     epochs = 1000,
-    replay_buffer = 50
+    replay_buffer = 25
 )
 
 run = wandb.init(entity='inscriptio', project='leslie', config=hyperparametre_defaults)
@@ -96,8 +96,9 @@ def reward(src,tgt,model):
     scaled_similarity = semantic_similarity(src,tgt,model)
     similarity_rating = scaled_similarity
 
-                                                      # rescale "doing nothing" to 0
-    return (simplification_rating + similarity_rating)-1
+                                                        # rescale "doing nothing" to 0
+    # return (simplification_rating + similarity_rating)-1
+    return similarity_rating-1
 
 print("Instantiating similarity model.")
 similarity_model = SentenceTransformer('stsb-bert-base')
@@ -161,10 +162,10 @@ for _ in range(EPOCHS):
         logits_probs = F.softmax(logits, dim=2)
 
         # Gather the log probability values of the selected actions
-        action_log_probs = logits_probs.gather(2, torch.unsqueeze(actions, 2)).log()
+        action_log_probs = logits_probs.gather(2, torch.unsqueeze(actions, 2))
 
         # Add em up, multiply by the advantage, and calculate the mean
-        actor_loss = (torch.stack([a*l for a,l in zip(rewards,action_log_probs)]).mean())/REPLAY
+        actor_loss = (torch.stack([-1*a*l for a,l in zip(rewards,action_log_probs)]).mean())/REPLAY
 
         # The critic wants to match the actual rewards as much as possible
         # So it's just MSE loss 
