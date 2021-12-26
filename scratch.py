@@ -33,9 +33,9 @@ print("Hello and welcome. Let's get started.")
 DEVICE = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 
 hyperparametre_defaults = dict(
-    max_length = 50,
-    actor_lr = 1e-5,
-    batch_size = 16,
+    max_length = 100,
+    actor_lr = 3e-6,
+    batch_size = 8,
     epochs = 1000,
     replay_buffer = 25
 )
@@ -69,8 +69,8 @@ usage_stddev = statistics.stdev(usage.values())
 # Finally, we normalize every value based on this
 # difference. We encourage results to be higher
 # than mean so we don't abs value. Also we will
-# take the tanh of the output to normalize it
-# between -1 and 1
+# take the sigmoid of the output to normalize it
+# between 0 and 1
 
 for key in usage.keys():
     usage[key] = np.tanh((usage[key]-usage_mean)/usage_stddev)
@@ -83,22 +83,17 @@ def semantic_similarity(a,b,model):
 
 # Mixed simplification reward 
 def reward(src,tgt,model):
-    words_src = [i.lower() for i in word_tokenize(src)]
     words_tgt = [i.lower() for i in word_tokenize(tgt)]
 
     try: 
-        usage_src = sum([usage[i] for i in words_src])/len(words_src)
-        usage_tgt = sum([usage[i] for i in words_tgt])/len(words_tgt)
-        simplification_rating = ((usage_tgt-usage_src)/usage_src)
+        # usage_src = sum([usage[i] for i in words_src])/len(words_src)/2
+        simplification_rating = sum([usage[i] for i in words_tgt])/len(words_tgt)
     except ZeroDivisionError:
-        simplification_rating = -2
+        simplification_rating = 0
 
-    scaled_similarity = semantic_similarity(src,tgt,model)
-    similarity_rating = scaled_similarity
+    # scaled_similarity = semantic_similarity(src,tgt,model)/2 - 0.5
 
-                                                        # rescale "doing nothing" to 0
-    # return (simplification_rating + similarity_rating)-1
-    return similarity_rating-1
+    return np.tanh(simplification_rating)
 
 print("Instantiating similarity model.")
 similarity_model = SentenceTransformer('stsb-bert-base')
@@ -155,38 +150,35 @@ for _ in range(EPOCHS):
         # Calculate reward value for these strings
         rewards = np2tens([reward(i,j,similarity_model) for i,j in zip(batch, logits_string)]).to(DEVICE)
 
-        # # Calculate the advantages of the model
-        # advantages = rewards -
-
-        # Get the logits' probs by normalizing with softmax
-        logits_probs = F.softmax(logits, dim=2)
-
         # Gather the log probability values of the selected actions
-        action_log_probs = logits_probs.gather(2, torch.unsqueeze(actions, 2))
+        action_logits = logits.gather(2, torch.unsqueeze(actions, 2))
 
         # Add em up, multiply by the advantage, and calculate the mean
-        actor_loss = (torch.stack([-1*a*l for a,l in zip(rewards,action_log_probs)]).mean())/REPLAY
+        actor_loss = (torch.stack([a*l.log() for a,l in zip(rewards,action_logits)]).mean())/REPLAY
 
         # The critic wants to match the actual rewards as much as possible
         # So it's just MSE loss 
-        dataset_bar.set_description(f"Sample: {batch_id}, Actor: {round(actor_loss.item(),3)}, Reward: {round(rewards[0].item(),3)}")
+        dataset_bar.set_description(f"Sample: {logits_string[0][:50]}, Actor: {round(actor_loss.item(),3)}, Reward: {round(rewards[0].item(),3)}")
 
         if i % 50 == 0:
             print(f"Sample: {batch_id}; Output: {logits_string[0]}")
+            # print(f"Logits: {logits_probs[0]}")
 
         if i % 10 == 0:
             run.log({"actor_loss": actor_loss.item(),
                      # "critic_loss": critic_loss.item(),
                      # "advantage": advantages.mean().item(),
                      # "loss": loss.item(),
+                     "logits_sample": logits[0][-1],
                      "reward": rewards[0].item(),
-                     "sample": wandb.Html(logits_string[0])})
+                     "sample": wandb.Html(f"{batch[0]}<br />{logits_string[0]}")})
+
+        # Backprop!
+        actor_loss.backward()
 
         # if we hit the replay buffer, then go ahead and update weights
         if i != 0 and i % REPLAY == 0:
             actor_optim.step()
             actor_optim.zero_grad()
 
-        # Backprop!
-        actor_loss.backward()
-        torch.nn.utils.clip_grad_norm_(bart_model.parameters(), 0.1)
+        # torch.nn.utils.clip_grad_norm_(bart_model.parameters(), 0.1)
